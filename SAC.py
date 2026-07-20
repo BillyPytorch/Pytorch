@@ -56,23 +56,24 @@ class ActorNetwork(nn.Module):
     def sample_normal(self, state, reparameterize=True):
         mu, log_std = self.forward(state) # calls results of forward function
 
-        std = log_std.exp() # std-dev of bell curve, std= e^log_std (gradient)
+        std = log_std.exp() # std-dev of bell curve, e**log_std (gradient)
 
         # guarantees std > 0, which a standard deviation must be. compared to ln(log_std)
         # smoothly converts the network's unrestricted output into a positive width.
         # doesn't have the sharp corner at zero that abs() has.
         # doesn't make +x and -x produce the same standard deviation, as abs() does.
 
-        dist = Normal(mu, std) # bell curve distribution of actions (mean, std-dev)
+        dist = Normal(mu, std) # bell curve(probability) distribution of actions (mean, std-dev)
+        # 1 / (std * sqrt(2 * pi)) * e^(-1/2 * (x - mu / std) ** 2)
 
         # sample
         if reparameterize:
-            raw_actions = dist.rsample() # random sample from bell curve
+            raw_actions = dist.rsample() # random sample of bell curve centered at mu with spread of std = mu + std * rand(0,1)
         else:
             raw_actions = dist.sample()
 
         # squash to valid range
-        tanh_actions = T.tanh(raw_actions) # convert to range -1 to 1 (squash)
+        tanh_actions = T.tanh(raw_actions) # convert to range -1 to 1 (squash) hyperbolic tangent function prevents the infinity from tan functions e^2 - e^-2 / e^2 + e^-2
         action = tanh_actions * self.max_action # scale to max action range
 
         # log probability -liklihood of the raw_actions
