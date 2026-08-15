@@ -332,3 +332,31 @@ class Agent:
         self.critic_2.load_checkpoint()
         self.target_critic_1.load_checkpoint()
         self.target_critic_2.load_checkpoint()
+
+
+'''
+
+    def choose_action(self, observation, warmup=20_000):
+
+        state = T.tensor(
+            observation,
+            dtype=T.float32,
+            device=self.actor.device
+        ).unsqueeze(0)
+
+        state = self.obs_normalizer.normalize(state, clip=10.0)
+
+        if self.memory.mem_cntr < warmup:
+            return self.env.action_space.sample()
+
+        actions, _ = self.actor.sample_normal(
+            state,
+            reparameterize=False
+        )
+
+        return actions.detach().cpu().numpy()[0]
+
+
+'''
+
+
