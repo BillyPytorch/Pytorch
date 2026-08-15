@@ -1,93 +1,123 @@
-import os
-import torch as T
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.distributions.normal import Normal
+import gymnasium as gym
+from agent import Agent
+import matplotlib.pyplot as plt
+import numpy as np
 
+def main():
+    warmup_steps = 100_000
+    total_steps = 0
 
-class ActorNetwork(nn.Module):
-    # Input_dims: # observed states
-    def __init__(self, alpha, input_dims, max_action,
-                 fc1_dims=256, fc2_dims=256,
-                 n_actions=2, name='actor',
-                 chkpt_dir='tmp/sac'):
+    env = gym.make('HumanoidStandup-v5', render_mode = "human")
 
-        super(ActorNetwork, self).__init__()
-        self.input_dims = input_dims
-        self.n_actions = n_actions
-        self.name = name
-        self.checkpoint_dir = chkpt_dir
-        self.checkpoint_file = os.path.join(chkpt_dir, name + '_sac') # checkpoint file path
+    agent = Agent(alpha=1e-4, beta=1e-4, input_dims=env.observation_space.shape, env=env, gamma=0.995, n_actions=env.action_space.shape[0],
+                  max_size=1_000_000, tau=0.005, batch_size=512)
 
-        self.max_action = T.tensor(max_action, dtype=T.float32) # make a tensor
+    
+    # Load previous scores if they exista
+    start_episode, score_history = agent.load_checkpoint()
 
-        # --- network layers ---
-        self.fc1 = nn.Linear(*input_dims, fc1_dims) # y=Wx+b, *input_dims unpacks the dimensions of the input state *removes from tuple
-        self.fc2 = nn.Linear(fc1_dims, fc2_dims) # another fully connected layer
+    n_games = start_episode + 100_000
 
-        self.mu = nn.Linear(fc2_dims, n_actions) # mean of action distribution (center / best guess)
-        self.log_std = nn.Linear(fc2_dims, n_actions) # log standard deviation (controls exploration / uncertainty)
+    for episode in range(start_episode, n_games):
+        observation, info = env.reset()
+        state = observation
+        done = False
+        score = 0
 
-        # --- optimizer ---
-        self.optimizer = optim.Adam(self.parameters(), lr=alpha) # new weight = old weight - learning rate * bias-corrected moving average of gradient / (sqrt(bias-corrected moving average of squared gradient) + epsilon)
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu') # Run GPU if available
-        self.to(self.device) # move to device
-        self.max_action = self.max_action.to(self.device) # move num of actions to device
+        # initialize losses
+        critic_1_loss = None
+        critic_2_loss = None
+        actor_loss = None
+        
 
-        # numerical stability
-        self.LOG_STD_MIN = -20 # standard min about zero
-        self.LOG_STD_MAX = 2 # standard max about 7.4
+        while not done:
 
-    def forward(self, state):
-        x = F.relu(self.fc1(state)) # linear function made non-linear
-        x = F.relu(self.fc2(x)) # linear function made non-linear
+            # Select action
+            action = agent.choose_action(state, warmup=warmup_steps)
 
-        mu = self.mu(x) # final linear layer (average/preferred action) mu is the expected result its the mean for distribution of actions (center of bell curve)
-        log_std = self.log_std(x) # how much randomness to add (not complete until .exp()) = ln(std) width of bell curve based on current state
+            next_state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
 
-        # stabilize std
-        log_std = T.clamp(log_std,
-                              self.LOG_STD_MIN,
-                              self.LOG_STD_MAX) # sets a minimum and maximum limit
+            # Torso height
+            torso_height = env.unwrapped.data.qpos[2]
 
-        return mu, log_std
+            # Get torso body
+            torso_id = env.unwrapped.model.body("torso").id
 
-    def sample_normal(self, state, reparameterize=True):
-        mu, log_std = self.forward(state) # calls results of forward function
+            # Torso's local Z axis in world coordinates
+            torso_z_axis = env.unwrapped.data.xmat[torso_id].reshape(3, 3)[:, 2]
 
-        std = log_std.exp() # std-dev of bell curve, e**log_std (gradient)
+            # 1.0 = perfectly vertical
+            # 0.0 = horizontal
+            uprightness = torso_z_axis[2]
 
-        # guarantees std > 0, which a standard deviation must be. compared to ln(log_std)
-        # smoothly converts the network's unrestricted output into a positive width.
-        # doesn't have the sharp corner at zero that abs() has.
-        # doesn't make +x and -x produce the same standard deviation, as abs() does.
+            # Height reward
+            height_reward = np.clip((torso_height - 1.0) / 0.5, 0.0, 1.0)
 
-        dist = Normal(mu, std) # bell curve(probability) distribution of actions (mean, std-dev)
-        # 1 / (std * sqrt(2 * pi)) * e^(-1/2 * (x - mu / std) ** 2)
+            # Upright reward
+            upright_reward = np.clip(uprightness, 0.0, 1.0)
 
-        # sample
-        if reparameterize:
-            raw_actions = dist.rsample() # random sample of bell curve centered at mu with spread of std = mu + std * rand(0,1)
-        else:
-            raw_actions = dist.sample()
+            # Combined reward
+            reward += 10.0 * height_reward
+            reward += 50.0 * upright_reward
 
-        # squash to valid range
-        tanh_actions = T.tanh(raw_actions) # convert to range -1 to 1 (squash) hyperbolic tangent function prevents the infinity from tan functions e^2 - e^-2 / e^2 + e^-2
-        action = tanh_actions * self.max_action # scale to max action range
+            agent.remember(state, action, reward, next_state, terminated)
 
-        # log probability -liklihood of the raw_actions
-        log_prob = dist.log_prob(raw_actions) # learn formula
+            losses = agent.learn(warmup=warmup_steps)
 
-        # correction for tanh squashing
-        log_prob -= T.log(1 - tanh_actions.pow(2) + 1e-6)
+            state = next_state
+            total_steps += 1
+            score += reward
 
-        log_prob = log_prob.sum(dim=1, keepdim=True)
+            if losses is not None:
+                critic_1_loss, critic_2_loss, actor_loss = losses
 
-        return action, log_prob
+        # Save score after each episode
+        score_history.append(score)
 
-    def save_checkpoint(self):
-        T.save(self.state_dict(), self.checkpoint_file)
+        print(f'Episode {episode:4d}, Score: {score:.1f}')
 
-    def load_checkpoint(self):
-        self.load_state_dict(T.load(self.checkpoint_file))
+        if episode % 20 == 0 and critic_1_loss is not None:
+            print(
+                f"  Critic1 Loss: {critic_1_loss:.5f} | "
+                f"Critic2 Loss: {critic_2_loss:.5f} | "
+                f"Actor Loss: {actor_loss:.5f} | "
+                f"Replay Size: {agent.memory.mem_cntr}"
+            )
+
+        if (episode + 1) % 1000 == 0:
+            agent.save_checkpoint( episode + 1, score_history ) 
+            print( f"*** Checkpoint saved at episode " f"{episode + 1} ***" )
+
+    agent.save_checkpoint(n_games, score_history)
+    print("Training complete. Final checkpoint saved.")
+
+    # ---------- Plot after training finishes ----------
+    window = 100
+    if len(score_history) >= window:
+        moving_avg = np.convolve(
+            score_history,
+            np.ones(window) / window,
+            mode='valid'
+        )
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(score_history, alpha=0.3, label="Episode Reward")
+        plt.plot(
+            range(window - 1, len(score_history)),
+            moving_avg,
+            linewidth=2,
+            label=f"{window}-Episode Average"
+        )
+
+        plt.xlabel("Episode")
+        plt.ylabel("Reward")
+        plt.title("SAC Training on HumanoidStandup-v5")
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+    else:
+        print("Not enough episodes for moving average.")
+
+if __name__ == '__main__':
+    main()
