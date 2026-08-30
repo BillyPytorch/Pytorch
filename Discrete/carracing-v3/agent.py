@@ -1,11 +1,12 @@
-import torch as T
-from networks import ActorNetwork, CriticNetwork, ReplayBuffer, RunningMeanStd
+import torch as T, numpy as np
+import torch.nn.functional as F
+from networks import ActorNetwork, CriticNetwork, ReplayBuffer
 import os
 import torch.optim as optim
 
 class Agent:
-    def __init__(self, alpha=3e-4, beta=3e-4, input_dims=[17], env=None, gamma=0.99, n_actions=None, 
-                 max_size=100_000, tau=0.005, batch_size=256):
+    def __init__(self, alpha=1e-5, beta=1e-5, input_dims=(4, 84, 84), env=None, gamma=0.995, n_actions=3, 
+                 max_size=100_000 , tau=0.005, batch_size=256): #TODO max_size change
 
         # SAC hyterparameters
         self.env = env
@@ -18,14 +19,13 @@ class Agent:
         self.memory = ReplayBuffer(max_size=max_size, input_shape=input_dims, n_actions=n_actions)
 
         #Actor Network
-        self.actor = ActorNetwork(alpha=alpha, input_dims=input_dims, max_action=env.action_space.high, n_actions=n_actions, name='actor')
-
-        self.obs_normalizer = RunningMeanStd(shape=input_dims, epsilon=1e-4, device=self.actor.device)
+        self.actor = ActorNetwork(alpha=alpha, input_dims=input_dims, n_actions=n_actions, name='actor')
 
         # 1. Inside Agent.__init__:
-        self.target_entropy = -float(n_actions) * 0.7 # For 1D action space, target_entropy = -1.0
+        self.action_dim = env.action_space.shape[0]
+        self.target_entropy = -float(self.action_dim) # For 1D action space, target_entropy = -3.0 #TODO
         self.log_alpha = T.zeros(1, requires_grad=True, device=self.actor.device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=1e-5)
         self.entropy_alpha = self.log_alpha.exp().item()
 
 
@@ -44,80 +44,69 @@ class Agent:
         self.target_critic_1.eval()
         self.target_critic_2.eval()
 
+    @T.no_grad()
     def choose_action(self, observation, warmup=20_000):
-
+        if self.memory.mem_cntr < warmup:
+            return self.env.action_space.sample()
+        
+        
         state = T.tensor(
             observation,
             dtype=T.float32,
             device=self.actor.device
-        ).unsqueeze(0)
+        ).unsqueeze(0) / 255.0
 
-        state = self.obs_normalizer.normalize(state, clip=10.0)
+        actions, _ = self.actor.sample_normal(state, reparameterize=False)
+        #actions[0, 2] = 0.0
+        return actions.detach().cpu().numpy()[0]
 
+    @T.no_grad()
+    def choose_actions(self, observations, warmup=20_000):
+
+        # One random action for each environment during warmup
         if self.memory.mem_cntr < warmup:
-            return self.env.action_space.sample()
+            return np.array([
+                self.env.action_space.sample()
+                for _ in range(len(observations))], dtype=np.float32)
 
+        # observations shape:
+        # (num_envs, 4, 84, 84)
+        state = T.tensor(
+            observations,
+            dtype=T.float32,
+            device=self.actor.device
+        ) / 255.0
+
+        # Actor processes all environments as one batch
         actions, _ = self.actor.sample_normal(
             state,
             reparameterize=False
         )
 
-        return actions.detach().cpu().numpy()[0]
+        # actions shape:
+        # (num_envs, 3)
+        return actions.detach().cpu().numpy()
 
-    def remember(self, state, action, reward, new_state, done):
-
-        raw_state = T.tensor(
-            state,
-            dtype=T.float32,
-            device=self.actor.device
-        ).unsqueeze(0)
-
-        raw_new_state = T.tensor(
-            new_state,
-            dtype=T.float32,
-            device=self.actor.device
-        ).unsqueeze(0)
-
-        self.obs_normalizer.update(raw_state)
-        self.obs_normalizer.update(raw_new_state)
-
-        self.memory.store_transition(
-            state,
-            action,
-            reward,
-            new_state,
-            done
-        )
+    def remember(self, states, actions, rewards, next_states, dones):
+        for i in range(len(states)):
+            self.memory.store_transition(
+                states[i],
+                actions[i],
+                rewards[i],
+                next_states[i],
+                dones[i]
+            )
 
     # Update target critic networks with soft update
     def update_network_parameters(self, tau=None):
-        if tau is None: tau = self.tau
+        if tau is None:
+            tau = self.tau
 
-        # Get critic parameters w + b of fc1,fc2, and q
-        critic_1_params = self.critic_1.named_parameters()
-        critic_2_params = self.critic_2.named_parameters()
+        for param, target_param in zip(self.critic_1.parameters(), self.target_critic_1.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-        target_critic_1_params = self.target_critic_1.named_parameters()
-        target_critic_2_params = self.target_critic_2.named_parameters()
-
-        # Convert to dictionaries
-        critic_1_state_dict = dict(critic_1_params)
-        critic_2_state_dict = dict(critic_2_params)
-
-        target_critic_1_state_dict = dict(target_critic_1_params)
-        target_critic_2_state_dict = dict(target_critic_2_params)
-
-        # Soft update target critic 1
-        for name in critic_1_state_dict:
-            critic_param = critic_1_state_dict[name]
-            target_param = target_critic_1_state_dict[name]
-            target_param.data.copy_(tau * critic_param.data + (1 - tau) * target_param.data)    
-               
-        # Soft update target critic 2    
-        for name in critic_2_state_dict:
-            critic_param = critic_2_state_dict[name]
-            target_param = target_critic_2_state_dict[name]
-            target_param.data.copy_(tau * critic_param.data + (1 - tau) * target_param.data)
+        for param, target_param in zip(self.critic_2.parameters(), self.target_critic_2.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
     def learn(self, warmup=20_000):
         if self.memory.mem_cntr < warmup:
@@ -129,8 +118,6 @@ class Agent:
         # Convert numpy arrays to tensors
         state = state.to(self.actor.device)
         new_state = new_state.to(self.actor.device)
-        state = self.obs_normalizer.normalize(state)
-        new_state = self.obs_normalizer.normalize(new_state)
         action = action.to(self.actor.device)
         reward = reward.to(self.actor.device).view(-1,1)
         done = done.float().to(self.actor.device).view(-1,1)
@@ -149,26 +136,28 @@ class Agent:
             q_next = T.min(q1_next, q2_next)
 
             # SAC target
-            target = reward + self.gamma * (1 - done) * (q_next - self.entropy_alpha * next_log_probs)
+            alpha = self.log_alpha.exp()
+
+            target = reward + self.gamma * (1 - done) * (q_next - alpha * next_log_probs)
 
         # Current critic estimates
         q1 = self.critic_1.forward(state, action)
         q2 = self.critic_2.forward(state, action)
 
         # Mean squared error loss
-        critic_1_loss = T.nn.functional.mse_loss(q1, target)
-        critic_2_loss = T.nn.functional.mse_loss(q2, target)
+        critic_1_loss = F.mse_loss(q1, target)
+        critic_2_loss = F.mse_loss(q2, target)
 
         # Optimize critic 1
         self.critic_1.optimizer.zero_grad()
-        critic_1_loss.backward()
-        T.nn.utils.clip_grad_norm_(self.critic_1.parameters(), max_norm=1)
+        critic_1_loss.backward() # derivative (chain rule) going backwards through the layers (how much each parameter affects loss)
+        T.nn.utils.clip_grad_norm_(self.critic_1.parameters(), max_norm=1.0)
         self.critic_1.optimizer.step()
 
         # Optimizer critic 2
         self.critic_2.optimizer.zero_grad()
         critic_2_loss.backward()
-        T.nn.utils.clip_grad_norm_(self.critic_2.parameters(), max_norm=1)
+        T.nn.utils.clip_grad_norm_(self.critic_2.parameters(), max_norm=1.0)
         self.critic_2.optimizer.step()
 
         # Update Actor Network
@@ -184,7 +173,8 @@ class Agent:
         q_policy = T.min(q1_policy, q2_policy)
 
        # SAC actor loss
-        actor_loss = (self.entropy_alpha * log_probs - q_policy).mean()
+        alpha = self.log_alpha.exp()
+        actor_loss = (alpha * log_probs - q_policy).mean()
 
         # Update Actor
         self.actor.optimizer.zero_grad()
@@ -192,12 +182,16 @@ class Agent:
         self.actor.optimizer.step()
 
         # Update Entropy Alpha
-        alpha_loss = -(self.log_alpha * 
-                    (log_probs.detach() + self.target_entropy)).mean()
+        alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
 
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
+
+        with T.no_grad():
+            self.log_alpha.clamp_(
+                T.log(T.tensor(0.05, device=self.actor.device)),
+                T.log(T.tensor(1.0, device=self.actor.device)))
 
         # Current alpha value
         self.entropy_alpha = self.log_alpha.exp().item()
@@ -211,11 +205,7 @@ class Agent:
             # Soft-update target critics
         self.update_network_parameters()
 
-        return (
-            critic_1_loss.item(),
-            critic_2_loss.item(),
-            actor_loss.item()
-        )
+        return critic_1_loss.item(), critic_2_loss.item(), actor_loss.item()
 
 
     def save_checkpoint(self, episode, score_history):
@@ -240,8 +230,6 @@ class Agent:
             'log_alpha': self.log_alpha.detach().cpu(),
             'alpha_optimizer': self.alpha_optimizer.state_dict(),
 
-            'obs_normalizer': self.obs_normalizer.state_dict(),
-
             'memory': { 
                 'state_memory': self.memory.state_memory, 
                 'new_state_memory': self.memory.new_state_memory, 
@@ -252,19 +240,18 @@ class Agent:
                 }
             }
 
-        # Temporary file
-        temp_file = "C:\\Users\\Billy\\Documents\\sac_checkpoint.tmp"
+        # Always overwrite the same checkpoint
+        checkpoint_file = r"C:\Users\Billy\Documents\sac_checkpoint.pt"
+
+        # Save to a temporary file first
+        temp_file = r"C:\Users\Billy\Documents\sac_checkpoint.tmp"
+
         T.save(checkpoint, temp_file)
 
-        # Latest checkpoint
-        latest_file = "C:\\Users\\Billy\\Documents\\sac_checkpoint.pt"
-        os.replace(temp_file, latest_file)
+        # Atomically replace the old checkpoint
+        os.replace(temp_file, checkpoint_file)
 
-        # Episode-specific checkpoint
-        episode_file = f"C:\\Users\\Billy\\Documents\\sac_checkpoint_{episode}.pt"
-        T.save(checkpoint, episode_file)
-
-        print(f"Checkpoint saved: Episode {episode}")
+        print(f"Checkpoint overwritten: Episode {episode}")
 
     def load_checkpoint(self):
             
@@ -279,9 +266,6 @@ class Agent:
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic_1.load_state_dict(checkpoint['critic_1'])
         self.critic_2.load_state_dict(checkpoint['critic_2'])
-
-        self.obs_normalizer.load_state_dict(checkpoint['obs_normalizer'])
-
 
         # Restore replay buffer
         memory = checkpoint['memory']
@@ -304,6 +288,11 @@ class Agent:
         self.critic_2.optimizer.load_state_dict(checkpoint['critic_2_optimizer'])
 
         self.log_alpha.data.copy_(checkpoint['log_alpha'].to(self.actor.device))
+
+        self.log_alpha.data.clamp_(
+            T.log(T.tensor(0.05, device=self.actor.device)),
+            T.log(T.tensor(1.0, device=self.actor.device))
+        ) #TODO added clip
 
         self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
 
